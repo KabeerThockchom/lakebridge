@@ -95,9 +95,7 @@ class PipelineClass:
             return StepExecutionResult(step_name=step.name, status=StepExecutionStatus.COMPLETE)
         except DuckDBDDLError as e:
             # Local DuckDB DDL is our schema contract; never tolerate as ABSENT.
-            return StepExecutionResult(
-                step_name=step.name, status=StepExecutionStatus.ERROR, error_message=str(e)
-            )
+            return StepExecutionResult(step_name=step.name, status=StepExecutionStatus.ERROR, error_message=str(e))
         except (RuntimeError, ConnectionError) as e:
             # Optional: warn + ABSENT (customer isn't failed; maintainers get the cause).
             # Required: ERROR, which fails the run below.

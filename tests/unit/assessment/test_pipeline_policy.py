@@ -39,7 +39,9 @@ def _write_query(tmp_path: Path, name: str, sql: str) -> str:
     return str(path)
 
 
-def _sql_step(tmp_path: Path, name: str, query: str, ddl: str = "CREATE TABLE {name} (value INTEGER);", **kwargs) -> Step:
+def _sql_step(
+    tmp_path: Path, name: str, query: str, ddl: str = "CREATE TABLE {name} (value INTEGER);", **kwargs
+) -> Step:
     query_path = _write_query(tmp_path, f"{name}.sql", query)
     ddl_path = _write_query(tmp_path, f"{name}_ddl.sql", ddl.format(name=name))
     return Step(name=name, type="sql", extract_source=query_path, ddl_source=ddl_path, **kwargs)
