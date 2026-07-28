@@ -57,9 +57,11 @@ def test_teradata_pdcr_sql_steps_are_optional() -> None:
         assert sql_step.optional is True
 
 
-def test_teradata_pdcr_ddl_steps_are_required() -> None:
+def test_teradata_pdcr_sql_steps_have_required_ddl_source() -> None:
     config = _load_pipeline_config()
-    ddl_steps = [step for step in config.steps if step.flag == "active" and step.type == "ddl"]
-    pdcr_ddl = [step for step in ddl_steps if step.name.startswith("td_pdcr")]
-    assert len(pdcr_ddl) == 2
-    assert all(not step.optional for step in pdcr_ddl)
+    steps_by_name = {step.name: step for step in config.steps if step.flag == "active"}
+    for pdcr_step in ("td_pdcr_info_agg_extract", "td_pdcr_sp_exe_info_agg_extract"):
+        step = steps_by_name[pdcr_step]
+        assert step.type == "sql"
+        assert step.ddl_source
+        assert step.optional is True

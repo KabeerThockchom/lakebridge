@@ -39,6 +39,12 @@ def _write_query(tmp_path: Path, name: str, sql: str) -> str:
     return str(path)
 
 
+def _sql_step(tmp_path: Path, name: str, query: str, ddl: str = "CREATE TABLE {name} (value INTEGER);", **kwargs) -> Step:
+    query_path = _write_query(tmp_path, f"{name}.sql", query)
+    ddl_path = _write_query(tmp_path, f"{name}_ddl.sql", ddl.format(name=name))
+    return Step(name=name, type="sql", extract_source=query_path, ddl_source=ddl_path, **kwargs)
+
+
 def _run(config: PipelineConfig, executor: _FakeExecutor, tmp_path: Path) -> list[StepExecutionResult]:
     return PipelineClass(
         config, cast(DatabaseConnector, executor), tmp_path / "out.db", tmp_path / "creds.yml"
@@ -46,11 +52,9 @@ def _run(config: PipelineConfig, executor: _FakeExecutor, tmp_path: Path) -> lis
 
 
 def test_optional_step_tolerates_any_failure(tmp_path: Path) -> None:
-    required_path = _write_query(tmp_path, "required.sql", "SELECT 2")
-    optional_path = _write_query(tmp_path, "missing.sql", "SELECT 1")
     config = _config(
-        Step(name="required_metric", type="sql", extract_source=required_path),
-        Step(name="optional_metric", type="sql", extract_source=optional_path, optional=True),
+        _sql_step(tmp_path, "required_metric", "SELECT 2"),
+        _sql_step(tmp_path, "optional_metric", "SELECT 1", optional=True),
     )
     executor = _FakeExecutor(
         {
@@ -68,11 +72,9 @@ def test_optional_step_tolerates_any_failure(tmp_path: Path) -> None:
 
 def test_optional_step_tolerates_unclassified_driver_errors(tmp_path: Path) -> None:
     """Optional must tolerate failures even when the driver message is opaque."""
-    required_path = _write_query(tmp_path, "required.sql", "SELECT 2")
-    optional_path = _write_query(tmp_path, "opaque.sql", "SELECT 1")
     config = _config(
-        Step(name="required_metric", type="sql", extract_source=required_path),
-        Step(name="optional_metric", type="sql", extract_source=optional_path, optional=True),
+        _sql_step(tmp_path, "required_metric", "SELECT 2"),
+        _sql_step(tmp_path, "optional_metric", "SELECT 1", optional=True),
     )
     executor = _FakeExecutor(
         {
@@ -88,8 +90,7 @@ def test_optional_step_tolerates_unclassified_driver_errors(tmp_path: Path) -> N
 
 
 def test_required_step_failure_fails_pipeline(tmp_path: Path) -> None:
-    query_path = _write_query(tmp_path, "missing.sql", "SELECT 1")
-    config = _config(Step(name="required_metric", type="sql", extract_source=query_path))
+    config = _config(_sql_step(tmp_path, "required_metric", "SELECT 1"))
     executor = _FakeExecutor({"SELECT 1": ConnectionError("Database query failed: relation does not exist")})
 
     with pytest.raises(RuntimeError, match="errors in steps: required_metric"):
@@ -100,10 +101,9 @@ def test_source_ddl_optional_failure_is_tolerated(tmp_path: Path) -> None:
     """A wrong-variant view create referencing a missing base object degrades to ABSENT, not abort."""
     view_sql = "create view query_view as select * from missing_base_table;"
     ddl_path = _write_query(tmp_path, "view.sql", view_sql)
-    metric_path = _write_query(tmp_path, "metric.sql", "SELECT 3")
     config = _config(
         Step(name="query_view", type="source_ddl", extract_source=ddl_path, optional=True),
-        Step(name="metric", type="sql", extract_source=metric_path),
+        _sql_step(tmp_path, "metric", "SELECT 3"),
     )
     executor = _FakeExecutor(
         {
@@ -120,8 +120,14 @@ def test_source_ddl_optional_failure_is_tolerated(tmp_path: Path) -> None:
 
 def test_ddl_failure_is_fatal(tmp_path: Path) -> None:
     """Local DuckDB DDL targets our own schema; a failure there is our bug and must stay fatal."""
-    ddl_path = _write_query(tmp_path, "bad_ddl.sql", "THIS IS NOT VALID DDL;")
-    config = _config(Step(name="broken_table", type="ddl", extract_source=ddl_path))
+    config = _config(
+        _sql_step(
+            tmp_path,
+            "broken_table",
+            "SELECT 1",
+            ddl="THIS IS NOT VALID DDL;",
+        )
+    )
     executor = _FakeExecutor({})
 
     with pytest.raises(RuntimeError, match="error in DDL step: broken_table"):

@@ -29,6 +29,10 @@ class StepExecutionStatus(str, Enum):
     ABSENT = "ABSENT"
 
 
+class DuckDBDDLError(RuntimeError):
+    """Raised when local DuckDB DDL for a SQL step fails. Always fatal (never optional)."""
+
+
 @dataclass
 class StepExecutionResult:
     step_name: str
@@ -59,7 +63,10 @@ class PipelineClass:
             execution_results.append(result)
             self._log_step_result(result)
 
-            if step.type in {"ddl", "source_ddl"} and result.status == StepExecutionStatus.ERROR:
+            # source_ddl failures and local DuckDB DDL failures abort immediately.
+            if result.status == StepExecutionStatus.ERROR and (
+                step.type == "source_ddl" or (result.error_message or "").startswith("DDL execution failed")
+            ):
                 error_msg = f"Pipeline execution failed due to error in DDL step: {result.step_name}"
                 if result.error_message:
                     error_msg += f" - {result.error_message}"
@@ -86,6 +93,11 @@ class PipelineClass:
         try:
             self._dispatch_step(step)
             return StepExecutionResult(step_name=step.name, status=StepExecutionStatus.COMPLETE)
+        except DuckDBDDLError as e:
+            # Local DuckDB DDL is our schema contract; never tolerate as ABSENT.
+            return StepExecutionResult(
+                step_name=step.name, status=StepExecutionStatus.ERROR, error_message=str(e)
+            )
         except (RuntimeError, ConnectionError) as e:
             # Optional: warn + ABSENT (customer isn't failed; maintainers get the cause).
             # Required: ERROR, which fails the run below.
@@ -96,8 +108,6 @@ class PipelineClass:
         match step.type:
             case "sql":
                 self._execute_sql_step(step)
-            case "ddl":
-                self._execute_ddl_step(step)
             case "source_ddl":
                 self._execute_source_ddl_step(step)
             case "python":
@@ -117,6 +127,8 @@ class PipelineClass:
                 logger.info(f"Step {result.step_name} has completed successfully.")
 
     def _execute_sql_step(self, step: Step):
+        self._apply_duckdb_ddl(step)
+
         logging.debug(f"Reading query from file: {step.extract_source}")
         query = read_text(Path(step.extract_source))
 
@@ -126,12 +138,40 @@ class PipelineClass:
 
         logging.info(f"Executing query: {query}")
         result = self.executor.fetch(query)
-        self._save_to_db(result, step.name, str(step.mode))
+        self._save_to_db(result, step.name, step.mode)
+
+    def _apply_duckdb_ddl(self, step: Step) -> None:
+        """Create (or recreate) the DuckDB table declared by ``step.ddl_source``."""
+        if not step.ddl_source:
+            raise DuckDBDDLError(f"DDL execution failed: sql step '{step.name}' is missing ddl_source")
+
+        logging.debug(f"Reading DDL from file: {step.ddl_source}")
+        ddl = read_text(Path(step.ddl_source)).strip()
+        logging.info(f"Applying DuckDB DDL for table '{step.name}' (mode={step.mode})")
+
+        try:
+            with duckdb.connect(self._db_path) as conn:
+                conn.begin()
+                if step.mode == "overwrite":
+                    conn.execute(f"DROP TABLE IF EXISTS {step.name}")
+                    conn.execute(ddl)
+                    logging.debug(f"Recreated table '{step.name}' from DDL")
+                elif not self._table_exists(conn, step.name):
+                    conn.execute(ddl)
+                    logging.debug(f"Created table '{step.name}' from DDL")
+                else:
+                    logging.debug(f"Table '{step.name}' already exists; skipping DDL in append mode")
+                conn.commit()
+        except DuckDBDDLError:
+            raise
+        except Exception as e:
+            logging.error(f"DDL execution failed: {str(e)}")
+            raise DuckDBDDLError(f"DDL execution failed: {str(e)}") from e
 
     def _execute_source_ddl_step(self, step: Step):
         """Run a no-result DDL statement against the *source* database (one statement per file).
 
-        Distinct from ``ddl`` (which targets the local DuckDB extract) and from ``sql``
+        Distinct from DuckDB ``ddl_source`` on ``sql`` steps (local extract schema) and from ``sql``
         (which expects a result set: ``DatabaseConnector.fetch`` calls ``fetchall()`` and
         raises on statements that return no rows). Used to create/drop source-side
         views or objects that subsequent ``sql`` steps depend on.
@@ -149,28 +189,6 @@ class PipelineClass:
 
         logging.info(f"Executing source_ddl step '{step.name}' on source")
         self.executor.fetch(content)
-
-    def _execute_ddl_step(self, step: Step):
-        logging.debug(f"Reading DDL from file: {step.extract_source}")
-        ddl = read_text(Path(step.extract_source)).strip()
-
-        logging.info(f"Executing DDL for table '{step.name}'")
-
-        try:
-            # TODO: Handle schema evolution
-            # Current implementation just checks for table existence;
-            # mode logic becomes irrelevant for ddl step.
-            with duckdb.connect(self._db_path) as conn:
-                conn.begin()
-                if not self._table_exists(conn, step.name):
-                    conn.execute(ddl)
-                    conn.commit()
-                    logging.debug(f"Created new table '{step.name}'")
-                else:
-                    logging.debug(f"Table '{step.name}' already exists, skipping DDL execution")
-        except Exception as e:
-            logging.error(f"DDL execution failed: {str(e)}")
-            raise RuntimeError(f"DDL execution failed: {str(e)}") from e
 
     def _execute_python_step(self, step: Step):
         logging.debug(f"Executing Python script: {step.extract_source}")
@@ -223,10 +241,10 @@ class PipelineClass:
             raise RuntimeError(f"Script execution failed with exit code {process.returncode}")
 
     def _save_to_db(self, result: FetchResult, step_name: str, mode: str):
-        # Check row count and log appropriately and skip data insertion if 0 rows
         if not result.rows:
             logging.warning(
-                f"Query for step '{step_name}' returned 0 rows. Skipping table creation and data insertion."
+                f"Query for step '{step_name}' returned 0 rows. "
+                f"Table schema was applied from DDL; skipping data insertion."
             )
             return
 
@@ -234,35 +252,13 @@ class PipelineClass:
         logging.info(f"Query for step '{step_name}' returned {row_count} rows.")
 
         with duckdb.connect(self._db_path) as conn:
-            # Note: step_name is validated to be SQL-safe by Step.__post_init__
-            table_exists = self._table_exists(conn, step_name)
+            # Table is created by _apply_duckdb_ddl before this method runs.
+            _result_frame = result.to_df()
             conn.begin()
-            if table_exists and mode == 'overwrite':
-                # Table exists and overwrite mode: Truncate then insert within a transaction to preserve existing DDL schema
-                _result_frame = result.to_df()
-                # Note: step_name is validated to be SQL-safe by Step.__post_init__
-                logging.debug(f"Overwriting existing table '{step_name}'")
-                conn.execute(f"TRUNCATE {step_name}")
-                conn.execute(f"INSERT INTO {step_name} SELECT * FROM _result_frame")
-            else:
-                if table_exists:
-                    # Table exists and append mode: insert into existing table (DuckDB handles type conversion)
-                    _result_frame = result.to_df()
-                    # Note: step_name is validated to be SQL-safe by Step.__post_init__
-                    statement = f"INSERT INTO {step_name} SELECT * FROM _result_frame"
-                    logging.debug(f"Appending to existing table '{step_name}'")
-                else:
-                    # Table doesn't exist: create table with native types from query result
-                    # Use DDL steps for explicit type control when needed
-                    _result_frame = result.to_df()
-                    # Note: step_name is validated to be SQL-safe by Step.__post_init__
-                    statement = f"CREATE TABLE {step_name} AS SELECT * FROM _result_frame"
-                    logging.debug(f"Creating new table '{step_name}' with native types")
-
-                logging.debug(f"Executing: {statement}")
-                conn.execute(statement)
-
-            # Explicit commit before context exit
+            statement = f"INSERT INTO {step_name} SELECT * FROM _result_frame"
+            logging.debug(f"{'Overwriting' if mode == 'overwrite' else 'Appending'} table '{step_name}' via INSERT")
+            logging.debug(f"Executing: {statement}")
+            conn.execute(statement)
             conn.commit()
             logging.info(f"Successfully processed {row_count} rows for table '{step_name}'.")
 
