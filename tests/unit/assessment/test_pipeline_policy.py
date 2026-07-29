@@ -142,20 +142,13 @@ def test_optional_absence_integration_fixture(test_resources: Path, tmp_path: Pa
     config = Profiler.path_modifier(config_file=config_path, path_prefix=test_resources)
     required_sql = (test_resources / "assessments" / "usage.sql").read_text(encoding="utf-8")
     missing_sql = (test_resources / "assessments" / "missing_table_query.sql").read_text(encoding="utf-8")
+    usage_columns = (
+        "sql_handle,creation_time,last_execution_time,execution_count,"
+        "total_worker_time,total_elapsed_time,total_rows"
+    ).split(",")
     executor = _FakeExecutor(
         {
-            required_sql: FetchResult(
-                [
-                    "sql_handle",
-                    "creation_time",
-                    "last_execution_time",
-                    "execution_count",
-                    "total_worker_time",
-                    "total_elapsed_time",
-                    "total_rows",
-                ],
-                [("abc", None, None, 1, 0, 0, 0)],
-            ),
+            required_sql: FetchResult(usage_columns, [("abc", None, None, 1, 0, 0, 0)]),
             missing_sql: ConnectionError("Database query failed: Invalid object name 'non_existent_table'."),
         }
     )
