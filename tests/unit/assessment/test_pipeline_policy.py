@@ -128,11 +128,31 @@ def test_ddl_failure_is_fatal(tmp_path: Path) -> None:
             "broken_table",
             "SELECT 1",
             ddl="THIS IS NOT VALID DDL;",
-        )
+        ),
+        _sql_step(tmp_path, "should_not_run", "SELECT 2"),
     )
-    executor = _FakeExecutor({})
+    executor = _FakeExecutor({"SELECT 2": FetchResult(["value"], [(2,)])})
 
     with pytest.raises(RuntimeError, match="error in DDL step: broken_table"):
+        _run(config, executor, tmp_path)
+
+
+def test_source_ddl_required_failure_aborts_immediately(tmp_path: Path) -> None:
+    """Required source_ddl failures are ERROR_FATAL and must not continue to later steps."""
+    view_sql = "create view query_view as select * from missing_base_table;"
+    ddl_path = _write_query(tmp_path, "view.sql", view_sql)
+    config = _config(
+        Step(name="query_view", type="source_ddl", extract_source=ddl_path),
+        _sql_step(tmp_path, "should_not_run", "SELECT 3"),
+    )
+    executor = _FakeExecutor(
+        {
+            view_sql: ConnectionError("Database query failed: relation missing_base_table does not exist"),
+            "SELECT 3": FetchResult(["value"], [(3,)]),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="error in DDL step: query_view"):
         _run(config, executor, tmp_path)
 
 

@@ -25,6 +25,7 @@ def make_profiler_db_filename(platform: str) -> str:
 class StepExecutionStatus(str, Enum):
     COMPLETE = "COMPLETE"
     ERROR = "ERROR"
+    ERROR_FATAL = "ERROR_FATAL"
     SKIPPED = "SKIPPED"
     ABSENT = "ABSENT"
 
@@ -63,10 +64,7 @@ class PipelineClass:
             execution_results.append(result)
             self._log_step_result(result)
 
-            # source_ddl failures and local DuckDB DDL failures abort immediately.
-            if result.status == StepExecutionStatus.ERROR and (
-                step.type == "source_ddl" or (result.error_message or "").startswith("DDL execution failed")
-            ):
+            if result.status == StepExecutionStatus.ERROR_FATAL:
                 error_msg = f"Pipeline execution failed due to error in DDL step: {result.step_name}"
                 if result.error_message:
                     error_msg += f" - {result.error_message}"
@@ -94,12 +92,16 @@ class PipelineClass:
             self._dispatch_step(step)
             return StepExecutionResult(step_name=step.name, status=StepExecutionStatus.COMPLETE)
         except DuckDBDDLError as e:
-            # Local DuckDB DDL is our schema contract; never tolerate as ABSENT.
-            return StepExecutionResult(step_name=step.name, status=StepExecutionStatus.ERROR, error_message=str(e))
+            return StepExecutionResult(
+                step_name=step.name, status=StepExecutionStatus.ERROR_FATAL, error_message=str(e)
+            )
         except (RuntimeError, ConnectionError) as e:
-            # Optional: warn + ABSENT (customer isn't failed; maintainers get the cause).
-            # Required: ERROR, which fails the run below.
-            status = StepExecutionStatus.ABSENT if step.optional else StepExecutionStatus.ERROR
+            if step.optional:
+                status = StepExecutionStatus.ABSENT
+            elif step.type == "source_ddl":
+                status = StepExecutionStatus.ERROR_FATAL
+            else:
+                status = StepExecutionStatus.ERROR
             return StepExecutionResult(step_name=step.name, status=status, error_message=str(e))
 
     def _dispatch_step(self, step: Step) -> None:
@@ -115,7 +117,7 @@ class PipelineClass:
 
     def _log_step_result(self, result: StepExecutionResult):
         match result.status:
-            case StepExecutionStatus.ERROR:
+            case StepExecutionStatus.ERROR | StepExecutionStatus.ERROR_FATAL:
                 logger.error(f"Step {result.step_name} failed with error: {result.error_message}")
             case StepExecutionStatus.ABSENT:
                 logger.warning(f"Optional step {result.step_name} failed and was tolerated: {result.error_message}")
@@ -139,7 +141,13 @@ class PipelineClass:
         self._save_to_db(result, step.name, step.mode)
 
     def _apply_duckdb_ddl(self, step: Step) -> None:
-        """Create (or recreate) the DuckDB table declared by ``step.ddl_source``."""
+        """Apply local DuckDB schema from ``step.ddl_source`` before a SQL extract inserts rows.
+
+        Distinct from ``source_ddl`` (which runs against the source database). Every ``sql`` step
+        calls this first so the extract table always has an explicit typed schema. In ``overwrite``
+        mode the table is dropped and recreated; in ``append`` mode DDL runs only when the table
+        is missing. Failures raise ``DuckDBDDLError`` and abort the pipeline (never optional).
+        """
         if not step.ddl_source:
             raise DuckDBDDLError(f"DDL execution failed: sql step '{step.name}' is missing ddl_source")
 
@@ -160,8 +168,6 @@ class PipelineClass:
                 else:
                     logging.debug(f"Table '{step.name}' already exists; skipping DDL in append mode")
                 conn.commit()
-        except DuckDBDDLError:
-            raise
         except Exception as e:
             logging.error(f"DDL execution failed: {str(e)}")
             raise DuckDBDDLError(f"DDL execution failed: {str(e)}") from e
